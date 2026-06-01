@@ -1,74 +1,92 @@
-import os
+"""
+Agent v1: Static Database Budget Advisor
+Uses only the 'get_local_living_costs' tool to adjust advice based on city stats.
+"""
+
+import json
 import re
-from typing import List, Dict, Any, Optional
+import time
+from typing import Any, Dict, List, Optional
+
 from src.core.llm_provider import LLMProvider
 from src.telemetry.logger import logger
+from src.telemetry.metrics import tracker
 
 class ReActAgent:
-    """
-    SKELETON: A ReAct-style Agent that follows the Thought-Action-Observation loop.
-    Students should implement the core loop logic and tool execution.
-    """
-    
-    def __init__(self, llm: LLMProvider, tools: List[Dict[str, Any]], max_steps: int = 5):
+    def __init__(self, llm: LLMProvider, tools: List[Dict[str, Any]], tool_registry: Dict, max_steps: int = 8):
         self.llm = llm
         self.tools = tools
+        self.tool_registry = tool_registry
         self.max_steps = max_steps
         self.history = []
 
     def get_system_prompt(self) -> str:
-        """
-        TODO: Implement the system prompt that instructs the agent to follow ReAct.
-        Should include:
-        1.  Available tools and their descriptions.
-        2.  Format instructions: Thought, Action, Observation.
-        """
-        tool_descriptions = "\n".join([f"- {t['name']}: {t['description']}" for t in self.tools])
-        return f"""
-        You are an intelligent assistant. You have access to the following tools:
-        {tool_descriptions}
+        return """You are a Personal Finance Agent V1.
+Your task is to advise users on budgeting based on their location.
 
-        Use the following format:
-        Thought: your line of reasoning.
-        Action: tool_name(arguments)
-        Observation: result of the tool call.
-        ... (repeat Thought/Action/Observation if needed)
-        Final Answer: your final response.
-        """
+Available Tools:
+- get_local_living_costs: Get average living costs for a specific city. Args: {"city": "Hà Nội"}
+
+STRICT OUTPUT FORMAT:
+Thought: <reasoning>
+Action: {"tool": "<tool_name>", "args": {<arguments as JSON>}}
+
+When you have enough info, output:
+Final Answer: <your advice>
+
+RULES:
+1. ALWAYS call get_local_living_costs if the user provides a city.
+2. Adjust your budget advice based on the living costs data returned by the tool rather than using rigid textbook formulas.
+3. ALWAYS RESPOND IN VIETNAMESE.
+"""
 
     def run(self, user_input: str) -> str:
-        """
-        TODO: Implement the ReAct loop logic.
-        1. Generate Thought + Action.
-        2. Parse Action and execute Tool.
-        3. Append Observation to prompt and repeat until Final Answer.
-        """
-        logger.log_event("AGENT_START", {"input": user_input, "model": self.llm.model_name})
-        
-        current_prompt = user_input
+        system_prompt = self.get_system_prompt()
+        prompt_history = [f"User Query: {user_input}"]
         steps = 0
+        self.history = []
 
         while steps < self.max_steps:
-            # TODO: Generate LLM response
-            # result = self.llm.generate(current_prompt, system_prompt=self.get_system_prompt())
-            
-            # TODO: Parse Thought/Action from result
-            
-            # TODO: If Action found -> Call tool -> Append Observation
-            
-            # TODO: If Final Answer found -> Break loop
-            
-            steps += 1
-            
-        logger.log_event("AGENT_END", {"steps": steps})
-        return "Not implemented. Fill in the TODOs!"
+            current_prompt = "\n".join(prompt_history)
+            t0 = time.time()
+            try:
+                result = self.llm.generate(current_prompt, system_prompt=system_prompt)
+                response = result["content"]
+            except Exception as exc:
+                break
 
-    def _execute_tool(self, tool_name: str, args: str) -> str:
-        """
-        Helper method to execute tools by name.
-        """
-        for tool in self.tools:
-            if tool['name'] == tool_name:
-                # TODO: Implement dynamic function calling or simple if/else
-                return f"Result of {tool_name}"
-        return f"Tool {tool_name} not found."
+            if "Final Answer:" in response:
+                return response.split("Final Answer:")[-1].strip()
+
+            action = self._parse_action(response)
+            if action is None:
+                prompt_history.append(response)
+                prompt_history.append('Observation: [PARSE ERROR] Use format Action: {"tool": "name", "args": {}}')
+                steps += 1
+                continue
+
+            tool_name = action.get("tool", "")
+            tool_args = action.get("args", {})
+            observation = self._execute_tool(tool_name, tool_args)
+
+            self.history.append({"step": steps, "tool_called": tool_name, "tool_args": tool_args, "observation": observation})
+            prompt_history.append(response)
+            prompt_history.append(f"Observation: {observation}")
+            steps += 1
+
+        return "Agent reached max steps."
+
+    def _parse_action(self, response: str) -> Optional[Dict]:
+        match = re.search(r"Action:\s*(\{.*?\})\s*(?:\n|$)", response, re.DOTALL)
+        if match:
+            try: return json.loads(match.group(1))
+            except: pass
+        return None
+
+    def _execute_tool(self, tool_name: str, args: Dict) -> str:
+        if tool_name not in self.tool_registry: return "Tool not found"
+        try: return str(self.tool_registry[tool_name](**args))
+        except Exception as e: return str(e)
+
+    def get_trace(self) -> List[Dict]:
+        return self.history
